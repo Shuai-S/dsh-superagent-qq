@@ -19,6 +19,7 @@
     "build": "tsdown",
     "typecheck": "tsc --noEmit",
     "check": "pnpm typecheck && pnpm build",
+    "prepare": "pnpm build",
     "probe": "node scripts/probe.mjs"
   },
   "dsh": {
