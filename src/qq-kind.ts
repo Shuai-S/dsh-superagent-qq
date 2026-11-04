@@ -1,0 +1,130 @@
+/** The 'qq' Source kind: QQ official bot messages arriving via the WebSocket
+ *  gateway, replies through the OpenAPI as passive replies. Shape mirrors the
+ *  bundled github/feishu kinds (docs/008-cookbook.md) and the dingtalk/mail
+ *  sibling plugins; the engine duck-types it at runtime. */
+import { z } from 'zod'
+import type { Localized, OutboundMessageLike, SourceKindLike, TriggerLike } from './types.ts'
+import { sendPassiveReply } from './robot.ts'
+
+export interface QqAccount { name: string; appId: string; appSecret: string }
+export interface QqGroup { appId: string; groupOpenid: string; name: string }
+
+export const HEALTH_ENTRY = 'qqGateway'
+const dmRowId = 'direct-messages'
+
+export const QqConfigSchema = z.object({
+  accounts: z.array(z.object({
+    name: z.string().default(''),
+    appId: z.string().default(''),
+    appSecret: z.string().default(''),
+  })).default([]),
+  groups: z.array(z.object({
+    appId: z.string().default(''),
+    groupOpenid: z.string().default(''),
+    name: z.string().default(''),
+  })).default([]),
+  directMessages: z.boolean().default(true),
+  sendAck: z.boolean().default(true),
+}).strict()
+export type QqConfig = z.infer<typeof QqConfigSchema>
+
+// channel.send reads config through this holder; watch() refreshes it every round.
+export const channelConfig: { current?: QqConfig } = {}
+
+export const qqKind = {
+  kind: 'qq',
+  title: { zh: 'QQ 机器人', en: 'QQ bot' },
+  description: {
+    zh: '直连 QQ 官方机器人平台：群内 @ 机器人或机器人单聊即可派活，回复以被动回复直接回 QQ。',
+    en: 'Direct QQ official bot via the WebSocket gateway: @ the bot in a group or DM it to dispatch; replies go back as passive replies.',
+  },
+  schema: QqConfigSchema,
+  fields: [
+    { key: 'accounts', type: 'rows', dialog: true, label: { zh: '机器人账号', en: 'Bot accounts' }, columns: [
+      { key: 'name', type: 'text', label: { zh: '名称', en: 'Name' }, optional: true, hint: { zh: '仅用于面板显示', en: 'Display only' } },
+      { key: 'appId', type: 'text', label: { zh: 'AppID', en: 'AppID' } },
+      { key: 'appSecret', type: 'text', label: { zh: 'AppSecret', en: 'AppSecret' }, hint: { zh: '明文存于引擎配置（本地 sqlite，仅本机可读）', en: 'Stored in engine config (local sqlite, readable only on this machine)' } },
+    ] },
+    { key: 'groups', type: 'rows', label: { zh: '接收的群', en: 'Group chats' }, columns: [
+      { key: 'appId', type: 'text', label: { zh: 'AppID', en: 'AppID' } },
+      { key: 'groupOpenid', type: 'text', label: { zh: '群 openid', en: 'Group openid' }, hint: { zh: '群内 @ 机器人发一条消息，日志会打印', en: 'Mention the bot once in the group; the log prints it' } },
+      { key: 'name', type: 'text', label: { zh: '群名', en: 'Name' }, optional: true },
+    ] },
+    { key: 'directMessages', type: 'switch', label: { zh: '接收机器人单聊', en: 'Receive bot direct messages' } },
+    { key: 'sendAck', type: 'switch', label: { zh: '「已收到」回执', en: '“Received” acknowledgement' }, hint: { zh: '收到消息先被动回复「已收到」，终答随后', en: 'Passively reply “received” on receipt; the final answer follows' } },
+  ],
+  health: ['qqGateway'],
+  scope(input: { meta: Record<string, unknown> }, config: QqConfig) {
+    const accountId = String(input.meta.accountId ?? '')
+    if (!config.accounts.some((a) => a.appId === accountId)) {
+      return { listened: false, reason: 'qq: account not configured: ' + accountId }
+    }
+    if (input.meta.scopeKind === 'c2c') {
+      if (!config.directMessages) return { listened: false, reason: 'qq: direct messages disabled' }
+      return { listened: true, observed: false, row: dmRowId }
+    }
+    const groupOpenid = String(input.meta.groupOpenid ?? '')
+    const row = config.groups.find((g) => g.groupOpenid === groupOpenid && g.appId === accountId)
+    if (!row) return { listened: false, reason: 'qq: group not configured: ' + groupOpenid }
+    return { listened: true, observed: false, row: row.groupOpenid }
+  },
+  channel: {
+    async send(_host: unknown, message: OutboundMessageLike): Promise<'sent' | 'gone'> {
+      const config = channelConfig.current
+      if (!config) throw new Error('qq: channel not ready (no config yet)')
+      const address = message.channel.address as Record<string, string>
+      // 「已收到」回执可在设置关闭：ack 在开关关闭时直接按已发送处理，不真正发消息。
+      if (message.kind === 'acknowledgement' && config.sendAck === false) return 'sent'
+      const account = config.accounts.find((a) => a.appId === address.account)
+      if (!account) throw new Error('qq: account not configured: ' + String(address.account ?? ''))
+      await sendPassiveReply(account.appId, account.appSecret, {
+        scope: address.scope === 'group' ? 'group' : 'c2c',
+        openid: address.openid ?? '',
+        msgId: address.msgId ?? '',
+      }, message.text)
+      console.error('[qq] reply sent: kind=' + message.kind + ' msgId=' + String(address.msgId ?? '(none)'))
+      return 'sent'
+    },
+    link(address: Record<string, string>) {
+      const label = 'QQ ' + String(address.openid ?? '').slice(0, 12)
+      return { url: '', label: { zh: label, en: label } }
+    },
+  },
+  threadContext: {
+    messageId(trigger: TriggerLike): string {
+      return String(trigger.meta.messageId ?? '')
+    },
+    async read(_commands: unknown, trigger: TriggerLike, part: 'thread' | 'root' | 'parent', _cursor: string | undefined, _config: QqConfig) {
+      // v1: the assessment reads the trigger's own message; conversation
+      // history needs more API permissions (M2+, aligned with dingtalk/mail v1).
+      const own = { id: String(trigger.meta.messageId ?? trigger.id), from: trigger.actor.id, at: trigger.at, text: trigger.text }
+      return { messages: part === 'parent' ? [] : [own], body: {}, status: undefined }
+    },
+  },
+  policy: {
+    schema: z.object({
+      allowed: z.array(z.object({ id: z.string(), name: z.string().optional() })).default([]),
+    }).strict(),
+    fields: [
+      { key: 'allowed', type: 'rows', label: { zh: '允许派活的成员', en: 'Allowed members' }, columns: [
+        { key: 'id', type: 'text', label: { zh: '成员 openid', en: 'Member openid' } },
+        { key: 'name', type: 'text', label: { zh: '名称', en: 'Name' }, optional: true },
+      ] },
+    ],
+    explicit: { zh: '群里 @ 机器人，或在机器人单聊里发言', en: 'Mentioned the bot in a chat, or messaged the bot directly' },
+    rows(config: Record<string, unknown>) {
+      // Defensive read: raw stored config, never parse the whole object here.
+      const groups = (Array.isArray(config.groups) ? config.groups : []) as QqGroup[]
+      const rows: { id: string; label: Localized | string; note: Localized; cells: { listedUnaddressed: boolean; unlistedAddressed: boolean; unlistedUnaddressed: boolean } }[] = groups.map((g) => ({
+        id: g.groupOpenid,
+        label: g.name || g.groupOpenid,
+        note: { zh: '群聊（仅 @ 可指派）', en: 'Group chat (mention to assign)' },
+        cells: { listedUnaddressed: false, unlistedAddressed: true, unlistedUnaddressed: false },
+      }))
+      if (config.directMessages !== false) {
+        rows.push({ id: dmRowId, label: { zh: '机器人单聊', en: 'Bot direct messages' }, note: { zh: '单聊消息均为明确指派', en: 'DMs are explicit assignments' }, cells: { listedUnaddressed: true, unlistedAddressed: true, unlistedUnaddressed: true } })
+      }
+      return rows
+    },
+  },
+} as unknown as SourceKindLike
