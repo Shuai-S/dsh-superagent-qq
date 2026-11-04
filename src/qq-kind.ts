@@ -1,10 +1,12 @@
 /** The 'qq' Source kind: QQ official bot messages arriving via the WebSocket
  *  gateway, replies through the OpenAPI as passive replies. Shape mirrors the
  *  bundled github/feishu kinds (docs/008-cookbook.md) and the dingtalk/mail
- *  sibling plugins; the engine duck-types it at runtime. */
+ *  sibling plugins; the engine duck-types it at runtime. Image attachments
+ *  arrive as [qq-image:KEY] markers in the trigger text and are downloaded on
+ *  demand through threadContext.image (dingtalk-kind precedent). */
 import { z } from 'zod'
 import type { Localized, OutboundMessageLike, SourceKindLike, TriggerLike } from './types.ts'
-import { sendPassiveReply } from './robot.ts'
+import { attachmentKey, downloadQqImage, isImageContentType, sendPassiveReply } from './robot.ts'
 
 export interface QqAccount { name: string; appId: string; appSecret: string }
 export interface QqGroup { appId: string; groupOpenid: string; name: string }
@@ -30,6 +32,12 @@ export type QqConfig = z.infer<typeof QqConfigSchema>
 
 // channel.send reads config through this holder; watch() refreshes it every round.
 export const channelConfig: { current?: QqConfig } = {}
+
+/** 从消息文本提取图片 key（与 buildTrigger 内嵌的 [qq-image:KEY] 标记配对）。
+ *  KEY 是附件 url 的派生哈希（robot.attachmentKey），提取只认原文出现过的 key；
+ *  image() 还会按 url 重算哈希核对，用户手打的假标记无法对上真实附件。 */
+const qqImageKeys = (text: string): string[] =>
+  [...new Set([...text.matchAll(/\[qq-image:([^\]]+)\]/g)].map((m) => m[1] ?? ''))].filter(Boolean)
 
 export const qqKind = {
   kind: 'qq',
@@ -93,6 +101,49 @@ export const qqKind = {
   threadContext: {
     messageId(trigger: TriggerLike): string {
       return String(trigger.meta.messageId ?? '')
+    },
+    // 图片支持（先例：引擎 feishu-image.ts / dingtalk-kind.ts）——images 从文本提取
+    // 标记 key，image 下载后经 attachments.saveImage 注入会话。
+    images(text: string): string[] {
+      return qqImageKeys(text)
+    },
+    async image(agent: unknown, _commands: unknown, trigger: TriggerLike, message: { id: string; text: string }, key: string, _stateDir: string, signal: AbortSignal) {
+      if (!qqImageKeys(message.text).includes(key)) throw new Error('Choose an image key from this source message')
+      // 附件定位：trigger.meta.attachments 由 buildTrigger 落盘（url/contentType/filename/key），
+      // 这里按 key 重算 url 哈希核对，防伪造 meta 拉取任意地址。
+      const stored = (trigger.meta as { attachments?: { url?: string; contentType?: string; filename?: string; key?: string }[] }).attachments
+      const list = Array.isArray(stored) ? stored : []
+      const att = list.find((a) => a.key === key)
+      if (!att || typeof att.url !== 'string' || !att.url || attachmentKey(att.url) !== key) {
+        throw new Error('qq: image attachment not found in this message: ' + key)
+      }
+      if (!isImageContentType(att.contentType)) throw new Error('qq: attachment is not an image: ' + key)
+      const host = agent as {
+        ctx?: { get?: (name: string) => unknown }
+        session?: { requestHeader?: () => { config?: { provider?: string; model?: string } } }
+        options?: { provider?: string; model?: string }
+      }
+      const attachments = host.ctx?.get?.('attachments') as {
+        saveImage: (input: { data: Buffer; mediaType: string; name: string }) => Promise<unknown>
+        imageLimits?: { maxImageBytes?: number; maxMessageImageBytes?: number }
+      } | undefined
+      if (!attachments?.saveImage) throw new Error('Image reading is unavailable: no attachment service is mounted')
+      const route = host.session?.requestHeader?.()?.config
+      const provider = route?.provider ?? host.options?.provider
+      const model = route?.model ?? host.options?.model
+      const llm = host.ctx?.get?.('llm') as { resolveModelInfo?: (p: string, m: string, s: AbortSignal) => Promise<{ inputModalities?: string[] }> } | undefined
+      if (!llm?.resolveModelInfo || !provider || !model) throw new Error('Image reading is unavailable: the current model route is unresolved')
+      const info = await llm.resolveModelInfo(provider, model, signal)
+      if (!info.inputModalities?.includes('image')) throw new Error('Model ' + model + ' does not support image input; the image has not been inspected')
+      signal.throwIfAborted()
+      // url 直取（不带任何鉴权头）：失败报错显式指向 spike，待真机核对后再补。
+      const media = await downloadQqImage(att.url)
+      const maxBytes = Math.min(attachments.imageLimits?.maxImageBytes ?? 20 * 1024 * 1024, attachments.imageLimits?.maxMessageImageBytes ?? 20 * 1024 * 1024)
+      if (media.data.length > maxBytes) throw new Error('The image exceeds the ' + maxBytes + ' byte limit')
+      const name = 'qq-' + (key.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'image') + '.' + media.mediaType.split('/')[1]
+      const image = await attachments.saveImage({ data: media.data, mediaType: media.mediaType, name })
+      signal.throwIfAborted()
+      return { source_message_id: message.id, image_key: key, image }
     },
     async read(_commands: unknown, trigger: TriggerLike, part: 'thread' | 'root' | 'parent', _cursor: string | undefined, _config: QqConfig) {
       // v1: the assessment reads the trigger's own message; conversation

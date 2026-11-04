@@ -7,6 +7,15 @@
  * intents GROUP_AND_C2C_EVENT = 1 << 25 (group @-events + C2C events).
  * Identify payload and event shapes are verified against real traffic by
  * scripts/probe.mjs before the engine wiring is trusted (M1 gate).
+ *
+ * Resume (M2 stretch): READY carries d.session_id; the client keeps it and the
+ * last dispatch sequence in memory. After a close that is not an
+ * INVALID_SESSION, the next HELLO sends RESUME (op 6, token + session_id +
+ * seq) instead of IDENTIFY; a RESUME that fails (op 9, or the socket closing
+ * before RESUMED) clears the session so the following attempt identifies
+ * fresh. Sessions live only inside one GatewayClient instance — the watch
+ * loop reuses the instance on its 5s reconnect rounds (resume) and builds a
+ * fresh one when the config hash changes (identify).
  */
 import type { QqAccount } from './qq-kind.ts'
 
@@ -16,6 +25,7 @@ export const GROUP_AND_C2C_EVENT = 1 << 25
 const OP_DISPATCH = 0
 const OP_HEARTBEAT = 1
 const OP_IDENTIFY = 2
+const OP_RESUME = 6
 const OP_RECONNECT = 7
 const OP_INVALID_SESSION = 9
 const OP_HELLO = 10
@@ -62,6 +72,10 @@ export class GatewayClient {
   private ws?: WebSocket
   private heartbeat?: NodeJS.Timeout
   private lastSeq = 0
+  private sessionId?: string
+  /** true between sending RESUME and seeing RESUMED; a close in that window
+   *  means the resume never confirmed -> drop the session (identify fallback). */
+  private resumePending = false
 
   constructor(private readonly account: QqAccount, private readonly handlers: Handlers) {}
 
@@ -87,7 +101,7 @@ export class GatewayClient {
       case OP_HELLO: {
         const d = payload.d as { heartbeat_interval?: number } | undefined
         const interval = Math.max(5000, Number(d?.heartbeat_interval ?? 30_000))
-        await this.identify()
+        await this.resumeOrIdentify()
         this.heartbeat = setInterval(() => {
           try { this.ws?.send(JSON.stringify({ op: OP_HEARTBEAT, d: this.lastSeq })) } catch { /* close handles */ }
         }, interval)
@@ -95,7 +109,16 @@ export class GatewayClient {
       }
       case OP_DISPATCH: {
         if (typeof payload.s === 'number') this.lastSeq = payload.s
-        if (payload.t === 'READY' || payload.t === 'RESUMED') {
+        if (payload.t === 'READY') {
+          const d = payload.d as { session_id?: string } | undefined
+          if (typeof d?.session_id === 'string' && d.session_id) this.sessionId = d.session_id
+          this.resumePending = false
+          this.connected = true
+          this.handlers.onConn(true)
+          break
+        }
+        if (payload.t === 'RESUMED') {
+          this.resumePending = false
           this.connected = true
           this.handlers.onConn(true)
           break
@@ -104,8 +127,14 @@ export class GatewayClient {
         break
       }
       case OP_RECONNECT:
+        // The server asks for a fresh connection but keeps the session: close;
+        // the watch loop reconnects on its next round and resumes.
+        this.disconnect()
+        break
       case OP_INVALID_SESSION:
-        // The server asks for a fresh session: close; the watch loop reconnects on its next round.
+        // Resume was refused (or the session died): identify fresh next time.
+        this.sessionId = undefined
+        this.resumePending = false
         this.disconnect()
         break
       default:
@@ -113,9 +142,16 @@ export class GatewayClient {
     }
   }
 
-  private async identify(): Promise<void> {
+  /** HELLO answer: RESUME when we hold a live session, IDENTIFY otherwise. */
+  private async resumeOrIdentify(): Promise<void> {
     try {
       const token = await getAppAccessToken(this.account.appId, this.account.appSecret)
+      if (this.sessionId && this.lastSeq > 0) {
+        this.resumePending = true
+        this.ws?.send(JSON.stringify({ op: OP_RESUME, d: { token: 'QQBot ' + token, session_id: this.sessionId, seq: this.lastSeq } }))
+        return
+      }
+      this.resumePending = false
       this.ws?.send(JSON.stringify({ op: OP_IDENTIFY, d: { token: 'QQBot ' + token, intents: GROUP_AND_C2C_EVENT, shard: [0, 1] } }))
     } catch (error) {
       console.error('[qq] identify failed: ' + String(error).slice(0, 200) + ' — the watch loop retries')
@@ -129,6 +165,9 @@ export class GatewayClient {
 
   private teardown(): void {
     if (this.heartbeat) { clearInterval(this.heartbeat); this.heartbeat = undefined }
+    // A close before RESUMED means the resume never confirmed: fall back to a
+    // fresh IDENTIFY on the next connect (session/seq kept only when confirmed).
+    if (this.resumePending) { this.sessionId = undefined; this.resumePending = false }
     this.connected = false
   }
 

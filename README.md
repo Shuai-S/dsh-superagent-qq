@@ -2,6 +2,7 @@
 
 QQ 官方机器人 Source 插件：WebSocket 网关长连接实时接收群 @ 消息与单聊（C2C）消息，
 走 superagent 引擎标准 准入→评估→Ticket→执行 链路，回复以被动回复直接回 QQ。
+断线重连优先 WS resume（op6 携带 session_id/seq），失败自动回退 IDENTIFY。
 
 ## 安装（superagent profile）
 
@@ -37,7 +38,16 @@ QQ_APPID=… QQ_SECRET=… pnpm probe 120                          # 指定秒�
 
 AppSecret 明文存于引擎本地配置（sqlite，仅本机可读）；后续可加凭据绑定方案。
 
-## 待真机核对（M1/M2）
+## 图片与文件
 
-- 事件字段名：`author.member_openid` vs `user_openid`、事件 `t` 名称、`content` 是否带 @ 前缀
-- 被动回复窗口时长与单条 msg_id 的被动回复条数上限
+- 图片：消息文本内嵌 `[qq-image:KEY]` 标记（KEY 为附件 url 的派生哈希），评估时
+  经 threadContext.image 按需下载注入会话（需模型支持图片输入）
+- 文件/视频：收到消息即落盘到 `~/.dsh/qq-attachments/<msgId>/`（分段下载 + 断点
+  续传 + 大小上限），路径与消化提示注入 trigger 文本；单件失败降级不阻塞
+
+## 待真机核对（M1/M2 spike 清单）
+
+- M1：事件字段名 `author.member_openid` vs `user_openid`、事件 `t` 名称、`content` 是否带 @ 前缀
+- M2：`d.attachments[{content_type, filename, url}]` 字段名与形态
+- M2：attachments url 是否需要鉴权头（当前直取不带 header，失败报错显式指向此项）
+- M2：被动回复窗口时长与单条 msg_id 的被动回复条数上限
