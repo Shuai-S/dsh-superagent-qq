@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "QQ Source",
+    "description": "QQ 官方机器人消息源：WebSocket 网关长连接实时接收群 @ 与单聊（C2C）消息，回复以被动回复直接回 QQ，断线自动 resume 重连。"
+  }
+}

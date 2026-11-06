@@ -1,16 +1,21 @@
 {
   "name": "dsh-superagent-qq",
   "description": "QQ Source for dsh-superagent: official QQ bot platform over the WebSocket gateway feeds group @-messages and C2C messages into the engine pipeline; replies go back via the OpenAPI as passive replies.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "MIT",
   "author": "Shuai-S",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
-    ".": "./lib/index.js"
+    ".": "./lib/index.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
   },
+  "icon": "icon.svg",
   "files": [
     "lib",
+    "locale",
+    "icon.svg",
     "cordis.patch.yml"
   ],
   "engines": {

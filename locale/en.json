@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "QQ Source",
+    "description": "Official QQ bot source: the WebSocket gateway feeds group @-mentions and C2C messages into the pipeline; replies go back as passive replies with automatic session resume."
+  }
+}
