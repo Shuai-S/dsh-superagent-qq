@@ -1,6 +1,7 @@
 {
   "meta": {
     "title": "QQ Source",
-    "description": "QQ 官方机器人消息源：WebSocket 网关长连接实时接收群 @ 与单聊（C2C）消息，回复以被动回复直接回 QQ，断线自动 resume 重连。"
+    "description": "QQ 官方机器人消息源：WebSocket 网关长连接实时接收群 @ 与 C2C 单聊消息，进引擎准入→评估→Ticket→执行链路，先被动回复「已收到」再送达终答。群与成员 openid 白名单在面板调整，断线自动 resume 重连。使用前需在 q.qq.com 注册机器人并开通群聊与单聊能力。",
+    "detail": "docs/DETAIL.zh.md"
   }
 }

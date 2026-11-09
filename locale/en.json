@@ -1,6 +1,7 @@
 {
   "meta": {
     "title": "QQ Source",
-    "description": "Official QQ bot source: the WebSocket gateway feeds group @-mentions and C2C messages into the pipeline; replies go back as passive replies with automatic session resume."
+    "description": "Official QQ bot source: a WebSocket gateway feeds group @-mentions and C2C direct chats into the engine pipeline, acknowledging with a passive reply before the final answer. Group and member openid allowlists tune on the panel; drops resume automatically. Requires a q.qq.com bot with group and C2C capabilities.",
+    "detail": "docs/DETAIL.md"
   }
 }
