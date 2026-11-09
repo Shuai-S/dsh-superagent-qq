@@ -7,11 +7,12 @@ import { mkdir, rename } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { SourceContextLike, TriggerLike } from './types.ts'
+import { aclDenyNoticeText, evaluateAcl } from './acl.ts'
 import { seenOrAdd } from './dedup.ts'
 import { channelConfig, flowStats, HEALTH_ENTRY } from './qq-kind.ts'
 import type { QqAccount, QqConfig } from './qq-kind.ts'
 import { GatewayClient, type GatewayEvent } from './gateway.ts'
-import { attachmentKey, downloadQqMediaToFile, isImageContentType, mediaKindOf, type MediaDownloadOpts } from './robot.ts'
+import { attachmentKey, downloadQqMediaToFile, isImageContentType, mediaKindOf, sendPassiveReply, type MediaDownloadOpts } from './robot.ts'
 
 export interface QqAttachment { content_type?: string; filename?: string; url?: string; [key: string]: unknown }
 
@@ -39,10 +40,11 @@ export function pause(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 /** 健康 detail 追加紧凑流量计数：in=入站消息（含重放）/ out=成功回复块 /
- *  fail=失败回复块 / last=最近一次失败时间（UTC HH:MM:SS，无则 '-'）。 */
-export function withFlowDetail(base: string, stats: { in: number; out: number; fail: number; lastFailAt?: string }): string {
+ *  fail=失败回复块 / deny=ACL 拒绝数 / last=最近一次失败时间（UTC HH:MM:SS，
+ *  无则 '-'）。 */
+export function withFlowDetail(base: string, stats: { in: number; out: number; fail: number; deny?: number; lastFailAt?: string }): string {
   const last = stats.lastFailAt ? stats.lastFailAt.slice(11, 19) : '-'
-  const counters = 'in=' + stats.in + ' out=' + stats.out + ' fail=' + stats.fail + ' last=' + last
+  const counters = 'in=' + stats.in + ' out=' + stats.out + ' fail=' + stats.fail + ' deny=' + (stats.deny ?? 0) + ' last=' + last
   return base ? base + ' ' + counters : counters
 }
 
@@ -212,6 +214,32 @@ async function handleEvent(source: SourceContextLike, account: QqAccount, event:
     dumped.add(account.appId)
     // 每账号首条消息 dump 原始 payload（≤500 字符）：核对真实字段名（M1/M2，含 attachments）。
     console.error('[qq] first payload dump (' + account.appId + ' ' + t + '): ' + JSON.stringify(d).slice(0, 500))
+  }
+  // ACL 判定（契约 §3）：派发（receive）之前、去重之后（重放不重复 deny 计数）；
+  // policy 缺省 = 全放行。会话类型信号用 M1 真机核对的字段集（probe.mjs）：
+  // 群消息带 group_openid，单聊带 user_openid——payload 无 group_type 字段。
+  const actorId = String(d.author?.member_openid ?? d.author?.user_openid ?? d.user_openid ?? '')
+  const groupSignal = typeof d.group_openid === 'string' && d.group_openid
+  const userSignal = typeof d.user_openid === 'string' && d.user_openid
+  const verdict = evaluateAcl(channelConfig.current?.policy, {
+    actorId,
+    conversationType: groupSignal ? 'group' : userSignal ? 'single' : undefined,
+  })
+  if (!verdict.allowed) {
+    flowStats.deny += 1
+    console.error('[qq] acl deny: reason=' + verdict.reason + ' actor=' + actorId + ' event=' + t)
+    // 回执 = 被动回复（引用入站 msg_id）。超回复窗口/发送失败都只记 stderr——
+    // 回执失败不是发送失败，不入 failure-log（send-failures.jsonl 语义）。
+    try {
+      await sendPassiveReply(account.appId, account.appSecret, {
+        scope: groupSignal ? 'group' : 'c2c',
+        openid: groupSignal ? String(d.group_openid) : (userSignal ? String(d.user_openid) : ''),
+        msgId: String(d.id ?? ''),
+      }, aclDenyNoticeText(verdict, 'zh'))
+    } catch (error) {
+      console.error('[qq] acl deny receipt failed: ' + String(error).slice(0, 200))
+    }
+    return
   }
   // 附件先落盘（带超时降级），receive 时路径已就位；图片只嵌标记，不在此下载。
   const media = await downloadMessageMedia(d)

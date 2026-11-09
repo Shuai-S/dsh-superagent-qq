@@ -25,6 +25,10 @@ try {
   const code = await readFile(resolve(root, 'lib', 'index.js'), 'utf8')
   if (!code.includes('sources.register(')) failures.push('lib/index.js 缺 sources.register( 探针（Source 未注册？）')
   if (!code.includes(KIND)) failures.push('lib/index.js 缺 kind 名探针：' + KIND)
+  // P-B 路由契约探针：webServer seam 路由名防漂移（client bundle 探针 N/A：本包
+  // 无 client bundle，「源设置」页壳属 P-C'）。
+  if (!code.includes('/dsh-qq/api')) failures.push("lib/index.js 缺路由前缀探针：'/dsh-qq/api'（deliver 路由名漂移？）")
+  if (!code.includes('/deliver')) failures.push("lib/index.js 缺 '/deliver' 路由字面量探针")
 } catch {
   failures.push('lib/index.js 不存在（先 pnpm check 构建）')
 }

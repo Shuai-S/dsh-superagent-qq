@@ -6,6 +6,7 @@
  *  demand through threadContext.image (dingtalk-kind precedent). */
 import { z } from 'zod'
 import type { Localized, OutboundMessageLike, SourceKindLike, TriggerLike } from './types.ts'
+import type { AclPolicy } from './acl.ts'
 import { chunkText, QQ_TEXT_LIMIT_BYTES } from './chunk.ts'
 import { logSendFailure } from './failure-log.ts'
 import { attachmentKey, downloadQqImage, isImageContentType, sendPassiveReply } from './robot.ts'
@@ -15,6 +16,15 @@ export interface QqGroup { appId: string; groupOpenid: string; name: string }
 
 export const HEALTH_ENTRY = 'qqGateway'
 const dmRowId = 'direct-messages'
+
+/** ACL 访问模式（契约 docs/rpc-contract.md §3；判定实现在 vendored src/acl.ts）。
+ *  不设 policy = 全放行（向后兼容）；形状非法按 schema 拒绝，不做静默降级。 */
+export const AclPolicySchema = z.object({
+  mode: z.enum(['allowlist', 'open']),
+  allowUsers: z.array(z.string()),
+  groupOnly: z.boolean().optional(),
+  denyText: z.object({ zh: z.string().min(1), en: z.string().min(1) }).optional(),
+}).strict()
 
 export const QqConfigSchema = z.object({
   accounts: z.array(z.object({
@@ -29,6 +39,7 @@ export const QqConfigSchema = z.object({
   })).default([]),
   directMessages: z.boolean().default(true),
   sendAck: z.boolean().default(true),
+  policy: AclPolicySchema.optional(),
 }).strict()
 export type QqConfig = z.infer<typeof QqConfigSchema>
 
@@ -36,8 +47,9 @@ export type QqConfig = z.infer<typeof QqConfigSchema>
 export const channelConfig: { current?: QqConfig } = {}
 
 /** 流量计数（watch 健康上报读取）：in=入站消息条数（含重放），out=成功回复块，
- *  fail=失败回复块；lastFailAt/lastFail 记最近一次失败。进程生命周期内累计。 */
-export const flowStats = { in: 0, out: 0, fail: 0, lastFailAt: '', lastFail: '' }
+ *  fail=失败回复块，deny=ACL 拒绝数（契约 §3：派发前拒绝，不进 in/out/fail，
+ *  failure-log 不记）；lastFailAt/lastFail 记最近一次失败。进程生命周期内累计。 */
+export const flowStats = { in: 0, out: 0, fail: 0, deny: 0, lastFailAt: '', lastFail: '' }
 
 /** 从消息文本提取图片 key（与 buildTrigger 内嵌的 [qq-image:KEY] 标记配对）。
  *  KEY 是附件 url 的派生哈希（robot.attachmentKey），提取只认原文出现过的 key；
