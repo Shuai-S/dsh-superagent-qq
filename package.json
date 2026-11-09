@@ -26,12 +26,19 @@
     "build": "tsdown",
     "typecheck": "tsc --noEmit",
     "check": "pnpm typecheck && pnpm build",
+    "test": "node --test 'test/*.test.mjs'",
     "prepare": "pnpm build",
     "probe": "node scripts/probe.mjs"
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "compatibility": {
+      "dsh": "0.2.2-rc.1",
+      "dshReleases": {
+        "0.2.2-rc.1": "compatible"
+      }
     },
     "manifestVersion": 1
   },

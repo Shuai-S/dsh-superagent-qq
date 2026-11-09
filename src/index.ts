@@ -30,4 +30,9 @@ export function apply(ctx: Context): void {
   })
 }
 export { qqKind, QqConfigSchema } from './qq-kind.ts'
-export { buildTrigger } from './watch.ts'
+export { buildTrigger, withFlowDetail } from './watch.ts'
+export { chunkText, QQ_TEXT_LIMIT_BYTES } from './chunk.ts'
+export { SEEN_LIMIT, sanitizeSegment, seenFile, seenOrAdd } from './dedup.ts'
+export { FAILURE_ERROR_MAX, FAILURE_LOG_LIMIT, logSendFailure, sendFailuresFile } from './failure-log.ts'
+export { GROUP_AND_C2C_EVENT, classifyPayload, heartbeatPayload, identifyPayload, resumePayload } from './gateway.ts'
+export { attachmentKey, isImageContentType, mediaKindOf } from './robot.ts'

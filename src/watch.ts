@@ -7,7 +7,8 @@ import { mkdir, rename } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { SourceContextLike, TriggerLike } from './types.ts'
-import { channelConfig, HEALTH_ENTRY } from './qq-kind.ts'
+import { seenOrAdd } from './dedup.ts'
+import { channelConfig, flowStats, HEALTH_ENTRY } from './qq-kind.ts'
 import type { QqAccount, QqConfig } from './qq-kind.ts'
 import { GatewayClient, type GatewayEvent } from './gateway.ts'
 import { attachmentKey, downloadQqMediaToFile, isImageContentType, mediaKindOf, type MediaDownloadOpts } from './robot.ts'
@@ -35,6 +36,14 @@ export function pause(ms: number, signal: AbortSignal): Promise<void> {
     const stop = () => { clearTimeout(timer); resolve() }
     signal.addEventListener('abort', stop, { once: true })
   })
+}
+
+/** 健康 detail 追加紧凑流量计数：in=入站消息（含重放）/ out=成功回复块 /
+ *  fail=失败回复块 / last=最近一次失败时间（UTC HH:MM:SS，无则 '-'）。 */
+export function withFlowDetail(base: string, stats: { in: number; out: number; fail: number; lastFailAt?: string }): string {
+  const last = stats.lastFailAt ? stats.lastFailAt.slice(11, 19) : '-'
+  const counters = 'in=' + stats.in + ' out=' + stats.out + ' fail=' + stats.fail + ' last=' + last
+  return base ? base + ' ' + counters : counters
 }
 
 const isoAt = (d: QqMessagePayload): string => {
@@ -188,6 +197,17 @@ async function handleEvent(source: SourceContextLike, account: QqAccount, event:
     return
   }
   const d = (event.d ?? {}) as QqMessagePayload
+  flowStats.in += 1
+  // 稳定消息 id 插件侧去重（服务端重推 / 双连重放；每 bot 一个 seen store），
+  // 引擎侧 trigger id 去重仍是第二道兜底；seen 存储不可写时 seenOrAdd 降级放行。
+  const msgId = String(d.id ?? '')
+  if (msgId) {
+    const seen = await seenOrAdd(account.appId, msgId)
+    if (seen) {
+      console.error('[qq] dedup skip: replayed msgId=' + msgId + ' (' + account.appId + ')')
+      return
+    }
+  }
   if (!dumped.has(account.appId)) {
     dumped.add(account.appId)
     // 每账号首条消息 dump 原始 payload（≤500 字符）：核对真实字段名（M1/M2，含 attachments）。
@@ -257,9 +277,9 @@ export async function ensureClients(source: SourceContextLike, state: WatchState
   const total = config.accounts.length
   const connected = config.accounts.filter((a) => state.clients.get(a.appId)?.isConnected()).length
   if (connected === total) {
-    source.report(HEALTH_ENTRY, { state: 'ready', detail: 'gateway connected (' + total + ' bots)' })
+    source.report(HEALTH_ENTRY, { state: 'ready', detail: withFlowDetail('gateway connected (' + total + ' bots)', flowStats) })
   } else {
-    source.report(HEALTH_ENTRY, { state: 'error', detail: 'connected ' + connected + '/' + total + '; reconnecting on next round' })
+    source.report(HEALTH_ENTRY, { state: 'error', detail: withFlowDetail('connected ' + connected + '/' + total + '; reconnecting on next round', flowStats) })
   }
 }
 

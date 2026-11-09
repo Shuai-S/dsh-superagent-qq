@@ -29,6 +29,7 @@ const OP_RESUME = 6
 const OP_RECONNECT = 7
 const OP_INVALID_SESSION = 9
 const OP_HELLO = 10
+const OP_HEARTBEAT_ACK = 11
 const WS_OPEN = 1 // WHATWG WebSocket readyState OPEN
 
 export interface TokenCache { token: string; expiresAt: number }
@@ -59,6 +60,59 @@ export async function authHeaders(appId: string, appSecret: string): Promise<Rec
 }
 
 export interface GatewayEvent { op: number; s?: number; t?: string; d?: unknown }
+
+/** Identify / RESUME / heartbeat wire payloads as pure builders: the op codes,
+ *  intents and shard stay unit-testable without a socket. */
+export function identifyPayload(token: string): string {
+  return JSON.stringify({ op: OP_IDENTIFY, d: { token: 'QQBot ' + token, intents: GROUP_AND_C2C_EVENT, shard: [0, 1] } })
+}
+
+export function resumePayload(token: string, sessionId: string, seq: number): string {
+  return JSON.stringify({ op: OP_RESUME, d: { token: 'QQBot ' + token, session_id: sessionId, seq } })
+}
+
+export function heartbeatPayload(seq: number): string {
+  return JSON.stringify({ op: OP_HEARTBEAT, d: seq })
+}
+
+export type PayloadAction =
+  | 'hello' | 'ready' | 'resumed' | 'dispatch' | 'reconnect' | 'invalid-session' | 'heartbeat-ack' | 'unknown'
+
+export interface ClassifiedPayload {
+  action: PayloadAction
+  /** dispatch sequence number when the frame carries one */
+  seq?: number
+  /** READY session id when present */
+  sessionId?: string
+  /** HELLO heartbeat interval, clamped to >= 5000ms (default 30000) */
+  heartbeatInterval?: number
+}
+
+/** Payload classification (pure): maps one gateway frame to the action the
+ *  client takes; handlePayload consumes it so the op/t tree is testable. */
+export function classifyPayload(payload: GatewayEvent): ClassifiedPayload {
+  switch (payload.op) {
+    case OP_HELLO:
+      return { action: 'hello', heartbeatInterval: Math.max(5000, Number((payload.d as { heartbeat_interval?: number } | undefined)?.heartbeat_interval ?? 30_000)) }
+    case OP_DISPATCH: {
+      const seq = typeof payload.s === 'number' ? payload.s : undefined
+      if (payload.t === 'READY') {
+        const sessionId = (payload.d as { session_id?: string } | undefined)?.session_id
+        return { action: 'ready', ...(seq !== undefined ? { seq } : {}), ...(typeof sessionId === 'string' && sessionId ? { sessionId } : {}) }
+      }
+      if (payload.t === 'RESUMED') return { action: 'resumed', ...(seq !== undefined ? { seq } : {}) }
+      return { action: 'dispatch', ...(seq !== undefined ? { seq } : {}) }
+    }
+    case OP_RECONNECT:
+      return { action: 'reconnect' }
+    case OP_INVALID_SESSION:
+      return { action: 'invalid-session' }
+    case OP_HEARTBEAT_ACK:
+      return { action: 'heartbeat-ack' }
+    default:
+      return { action: 'unknown' }
+  }
+}
 
 interface Handlers {
   onEvent: (event: GatewayEvent) => void
@@ -97,41 +151,41 @@ export class GatewayClient {
   }
 
   private async handlePayload(payload: GatewayEvent): Promise<void> {
-    switch (payload.op) {
-      case OP_HELLO: {
-        const d = payload.d as { heartbeat_interval?: number } | undefined
-        const interval = Math.max(5000, Number(d?.heartbeat_interval ?? 30_000))
+    const frame = classifyPayload(payload)
+    switch (frame.action) {
+      case 'hello': {
         await this.resumeOrIdentify()
         this.heartbeat = setInterval(() => {
-          try { this.ws?.send(JSON.stringify({ op: OP_HEARTBEAT, d: this.lastSeq })) } catch { /* close handles */ }
-        }, interval)
+          try { this.ws?.send(heartbeatPayload(this.lastSeq)) } catch { /* close handles */ }
+        }, frame.heartbeatInterval ?? 30_000)
         break
       }
-      case OP_DISPATCH: {
-        if (typeof payload.s === 'number') this.lastSeq = payload.s
-        if (payload.t === 'READY') {
-          const d = payload.d as { session_id?: string } | undefined
-          if (typeof d?.session_id === 'string' && d.session_id) this.sessionId = d.session_id
-          this.resumePending = false
-          this.connected = true
-          this.handlers.onConn(true)
-          break
-        }
-        if (payload.t === 'RESUMED') {
-          this.resumePending = false
-          this.connected = true
-          this.handlers.onConn(true)
-          break
-        }
+      case 'ready': {
+        if (typeof frame.seq === 'number') this.lastSeq = frame.seq
+        if (frame.sessionId) this.sessionId = frame.sessionId
+        this.resumePending = false
+        this.connected = true
+        this.handlers.onConn(true)
+        break
+      }
+      case 'resumed': {
+        if (typeof frame.seq === 'number') this.lastSeq = frame.seq
+        this.resumePending = false
+        this.connected = true
+        this.handlers.onConn(true)
+        break
+      }
+      case 'dispatch': {
+        if (typeof frame.seq === 'number') this.lastSeq = frame.seq
         this.handlers.onEvent(payload)
         break
       }
-      case OP_RECONNECT:
+      case 'reconnect':
         // The server asks for a fresh connection but keeps the session: close;
         // the watch loop reconnects on its next round and resumes.
         this.disconnect()
         break
-      case OP_INVALID_SESSION:
+      case 'invalid-session':
         // Resume was refused (or the session died): identify fresh next time.
         this.sessionId = undefined
         this.resumePending = false
@@ -148,11 +202,11 @@ export class GatewayClient {
       const token = await getAppAccessToken(this.account.appId, this.account.appSecret)
       if (this.sessionId && this.lastSeq > 0) {
         this.resumePending = true
-        this.ws?.send(JSON.stringify({ op: OP_RESUME, d: { token: 'QQBot ' + token, session_id: this.sessionId, seq: this.lastSeq } }))
+        this.ws?.send(resumePayload(token, this.sessionId, this.lastSeq))
         return
       }
       this.resumePending = false
-      this.ws?.send(JSON.stringify({ op: OP_IDENTIFY, d: { token: 'QQBot ' + token, intents: GROUP_AND_C2C_EVENT, shard: [0, 1] } }))
+      this.ws?.send(identifyPayload(token))
     } catch (error) {
       console.error('[qq] identify failed: ' + String(error).slice(0, 200) + ' — the watch loop retries')
     }

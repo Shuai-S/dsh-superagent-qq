@@ -6,6 +6,8 @@
  *  demand through threadContext.image (dingtalk-kind precedent). */
 import { z } from 'zod'
 import type { Localized, OutboundMessageLike, SourceKindLike, TriggerLike } from './types.ts'
+import { chunkText, QQ_TEXT_LIMIT_BYTES } from './chunk.ts'
+import { logSendFailure } from './failure-log.ts'
 import { attachmentKey, downloadQqImage, isImageContentType, sendPassiveReply } from './robot.ts'
 
 export interface QqAccount { name: string; appId: string; appSecret: string }
@@ -32,6 +34,10 @@ export type QqConfig = z.infer<typeof QqConfigSchema>
 
 // channel.send reads config through this holder; watch() refreshes it every round.
 export const channelConfig: { current?: QqConfig } = {}
+
+/** 流量计数（watch 健康上报读取）：in=入站消息条数（含重放），out=成功回复块，
+ *  fail=失败回复块；lastFailAt/lastFail 记最近一次失败。进程生命周期内累计。 */
+export const flowStats = { in: 0, out: 0, fail: 0, lastFailAt: '', lastFail: '' }
 
 /** 从消息文本提取图片 key（与 buildTrigger 内嵌的 [qq-image:KEY] 标记配对）。
  *  KEY 是附件 url 的派生哈希（robot.attachmentKey），提取只认原文出现过的 key；
@@ -85,12 +91,31 @@ export const qqKind = {
       if (message.kind === 'acknowledgement' && config.sendAck === false) return 'sent'
       const account = config.accounts.find((a) => a.appId === address.account)
       if (!account) throw new Error('qq: account not configured: ' + String(address.account ?? ''))
-      await sendPassiveReply(account.appId, account.appSecret, {
-        scope: address.scope === 'group' ? 'group' : 'c2c',
+      const target = {
+        scope: address.scope === 'group' ? 'group' as const : 'c2c' as const,
         openid: address.openid ?? '',
         msgId: address.msgId ?? '',
-      }, message.text)
-      console.error('[qq] reply sent: kind=' + message.kind + ' msgId=' + String(address.msgId ?? '(none)'))
+      }
+      const channelKey = account.appId + '|' + target.scope + '|' + target.openid
+      // UTF-8 安全边界分块（上限 2000 字节 unverified，见 chunk.ts 头注）：
+      // 块 1 失败照常抛出交引擎退避重试；k>1 块失败记日志（含 failure-log）并按已送达收尾。
+      const pieces = chunkText(message.text, QQ_TEXT_LIMIT_BYTES)
+      for (let k = 0; k < pieces.length; k++) {
+        try {
+          await sendPassiveReply(account.appId, account.appSecret, target, pieces[k])
+          flowStats.out += 1
+        } catch (error) {
+          flowStats.fail += 1
+          flowStats.lastFailAt = new Date().toISOString()
+          flowStats.lastFail = String(error).slice(0, 200)
+          await logSendFailure({ channelKey, kind: message.kind, error: String(error) })
+          if (k === 0) throw error
+          console.error('[qq] reply chunk ' + (k + 1) + '/' + pieces.length + ' failed after earlier chunk(s) landed; keeping sent: ' + String(error).slice(0, 200))
+          return 'sent'
+        }
+      }
+      console.error('[qq] reply sent: kind=' + message.kind + ' msgId=' + String(address.msgId ?? '(none)')
+        + (pieces.length > 1 ? ' chunks=' + pieces.length : ''))
       return 'sent'
     },
     link(address: Record<string, string>) {
