@@ -26,7 +26,7 @@ import { sendPassiveReply } from './robot.ts'
 import { channelConfig, flowStats, type QqConfig } from './qq-kind.ts'
 import { SEEN_LIMIT } from './dedup.ts'
 import { sendFailuresFile } from './failure-log.ts'
-import { findTarget, touchTarget, validTargetId, type TargetRecord } from './targets.ts'
+import { findTarget, readTargets, removeTarget, touchTarget, upsertTarget, validTargetId, type TargetRecord } from './targets.ts'
 
 /** @deepseek-ai/dsh-host-webserver 的结构化最小面（不引入包依赖；先例 wechat/dws）。 */
 export interface WebServerLike {
@@ -113,7 +113,7 @@ export function buildDeliverTrigger(target: TargetRecord, text: string, kind: 'n
       id,
       source: 'qq',
       threads: [{ source: 'qq', id: 'g:' + openid }],
-      actor: { source: 'qq', id: 'deliver' },
+      actor: { source: 'qq', id: 'dsh-superagent-qq' },
       human: false,
       addressed: 'direct',
       at: new Date().toISOString(),
@@ -127,7 +127,7 @@ export function buildDeliverTrigger(target: TargetRecord, text: string, kind: 'n
     id,
     source: 'qq',
     threads: [{ source: 'qq', id: 'c:' + openid }],
-    actor: { source: 'qq', id: 'deliver' },
+    actor: { source: 'qq', id: 'dsh-superagent-qq' },
     human: false,
     addressed: 'direct',
     at: new Date().toISOString(),
@@ -239,6 +239,29 @@ async function handleHealth(_req: IncomingMessage, res: ServerResponse, deps: De
 }
 
 /** 路由处理器（测试注入点：直接拿 handler 挂在任意 http server 上，url 需带前缀）。 */
+
+async function handleTargetsList(_req: IncomingMessage, res: ServerResponse, deps: DeliverDeps): Promise<void> {
+  respondJson(res, 200, { ok: true, targets: await readTargets(deps.baseDir) })
+}
+
+async function handleTargetUpsert(req: IncomingMessage, res: ServerResponse, deps: DeliverDeps): Promise<void> {
+  const body = await readJsonBody(req)
+  if (!body || !validTargetId(body.id)) { respondJson(res, 400, { error: 'bad-request', detail: 'valid targetId required' }); return }
+  if (!body.address || typeof body.address !== 'object' || Array.isArray(body.address)) { respondJson(res, 400, { error: 'bad-request', detail: 'address object required' }); return }
+  const address: Record<string, string> = {}
+  for (const [key, value] of Object.entries(body.address as Record<string, unknown>)) address[key] = String(value)
+  const label = typeof body.label === 'string' ? body.label : ''
+  const { created } = await upsertTarget({ id: body.id, address, label }, deps.baseDir)
+  respondJson(res, 200, { ok: true, created })
+}
+
+async function handleTargetDelete(req: IncomingMessage, res: ServerResponse, deps: DeliverDeps): Promise<void> {
+  const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+  const id = decodeURIComponent(url.pathname.slice((ROUTE_PREFIX + '/targets/').length))
+  const removed = await removeTarget(id, deps.baseDir)
+  respondJson(res, removed ? 200 : 404, removed ? { ok: true } : { error: 'unknown-target' })
+}
+
 export function createDeliverHandler(deps: DeliverDeps, port: number): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
   return async (req, res) => {
     if (!sameOrigin(req, port)) { respondJson(res, 403, { error: 'Same-origin management request required' }); return }
@@ -246,6 +269,9 @@ export function createDeliverHandler(deps: DeliverDeps, port: number): (req: Inc
     const path = url.pathname.startsWith(ROUTE_PREFIX) ? url.pathname.slice(ROUTE_PREFIX.length) : ''
     if (path === '/deliver' && req.method === 'POST') { await handleDeliver(req, res, deps); return }
     if (path === '/deliver/test' && req.method === 'POST') { await handleDeliverTest(req, res, deps); return }
+    if (path === '/targets' && req.method === 'GET') { await handleTargetsList(req, res, deps); return }
+    if (path === '/targets' && req.method === 'PUT') { await handleTargetUpsert(req, res, deps); return }
+    if (path.startsWith('/targets/') && req.method === 'DELETE') { await handleTargetDelete(req, res, deps); return }
     if (path === '/health' && req.method === 'GET') { await handleHealth(req, res, deps); return }
     respondJson(res, 404, { error: 'not found' })
   }

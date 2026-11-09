@@ -132,7 +132,7 @@ test('deliver: 受理构造非人类 Trigger（c2c 与 group 双形状）并更�
   const trig = received[0]
   assert.equal(trig.source, 'qq')
   assert.equal(trig.human, false)
-  assert.equal(trig.actor.id, 'deliver')
+  assert.equal(trig.actor.id, 'dsh-superagent-qq')
   assert.equal(trig.text, '发版完成')
   assert.deepEqual(trig.threads, [{ source: 'qq', id: 'c:U1' }])
   assert.equal(trig.channel.address.account, 'app1')

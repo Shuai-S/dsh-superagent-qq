@@ -25,12 +25,27 @@ try {
   const code = await readFile(resolve(root, 'lib', 'index.js'), 'utf8')
   if (!code.includes('sources.register(')) failures.push('lib/index.js 缺 sources.register( 探针（Source 未注册？）')
   if (!code.includes(KIND)) failures.push('lib/index.js 缺 kind 名探针：' + KIND)
-  // P-B 路由契约探针：webServer seam 路由名防漂移（client bundle 探针 N/A：本包
-  // 无 client bundle，「源设置」页壳属 P-C'）。
+  // P-B 路由契约探针：webServer seam 路由名防漂移。
   if (!code.includes('/dsh-qq/api')) failures.push("lib/index.js 缺路由前缀探针：'/dsh-qq/api'（deliver 路由名漂移？）")
   if (!code.includes('/deliver')) failures.push("lib/index.js 缺 '/deliver' 路由字面量探针")
 } catch {
   failures.push('lib/index.js 不存在（先 pnpm check 构建）')
+}
+
+// P-C'：client bundle 探针（壳注册标识，防 tree-shaking 假阴性）
+try {
+  if (manifest.exports && manifest.exports['./client']) {
+    const client = await readFile(resolve(root, 'lib', 'client.js'), 'utf8')
+    for (const probe of [
+      { label: 'sources shell page id', patterns: ['dsh-superagent-sources-settings'] },
+      { label: 'sources tab slot', patterns: ['dsh.sources.settings.tabs'] },
+      { label: 'panel id', patterns: ['dsh-superagent-qq'] },
+    ]) {
+      if (!probe.patterns.some((p) => client.includes(p))) failures.push('lib/client.js 缺 client 探针 [' + probe.label + ']')
+    }
+  }
+} catch {
+  failures.push('lib/client.js 不存在或不可读（build-client 先行）')
 }
 
 // 3) cordis.patch.yml 入口 id 与包名一致
